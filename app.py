@@ -20,57 +20,52 @@ uploaded_files = st.file_uploader(
 )
 
 
+def get_first_valid(df, col_name):
+    """指定したカラムの最初の非空値を取り出すヘルパー関数"""
+    if col_name in df.columns:
+        valid_vals = df[col_name].dropna().values
+        for val in valid_vals:
+            if pd.notna(val) and str(val).strip() != "":
+                return val
+    return np.nan
+
+
 def process_single_file(file):
     """1つのファイル（1被験者分）を1行のデータに変換する関数"""
     df = pd.read_csv(file)
 
-    # 被験者情報
-    p_id = (
-        df["participantID"].dropna().values[0]
-        if "participantID" in df.columns and len(df["participantID"].dropna()) > 0
-        else file.name
-    )
-    age = (
-        df["age"].dropna().values[0]
-        if "age" in df.columns and len(df["age"].dropna()) > 0
-        else np.nan
-    )
-    sex = (
-        df["sex"].dropna().values[0]
-        if "sex" in df.columns and len(df["sex"].dropna()) > 0
-        else np.nan
-    )
-    condition = (
-        df["condition"].dropna().values[0]
-        if "condition" in df.columns and len(df["condition"].dropna()) > 0
-        else np.nan
-    )
+    # 1. 被験者基本情報
+    p_id = get_first_valid(df, "participantID")
+    if pd.isna(p_id):
+        p_id = file.name
+    else:
+        # IDが数値の場合整数形式の文字列に整える
+        try:
+            p_id = str(int(float(p_id)))
+        except (ValueError, TypeError):
+            p_id = str(p_id)
 
-    # クイズ・集計指標
-    quiz_correct = (
-        df["quiz_correct_count"].dropna().values[0]
-        if "quiz_correct_count" in df.columns
-        and len(df["quiz_correct_count"].dropna()) > 0
-        else np.nan
-    )
-    quiz_total = (
-        df["quiz_total_count"].dropna().values[0]
-        if "quiz_total_count" in df.columns
-        and len(df["quiz_total_count"].dropna()) > 0
-        else np.nan
-    )
+    age = get_first_valid(df, "age")
+    sex = get_first_valid(df, "sex")
+    condition = get_first_valid(df, "condition")
 
-    # クイズ正答率・平均反応時間計算
-    quiz_df = (
-        df[df["sender"] == "Showquiz"] if "sender" in df.columns else pd.DataFrame()
-    )
-    quiz_acc = (
-        quiz_df["correct"].astype(bool).mean()
-        if not quiz_df.empty and "correct" in quiz_df.columns
-        else np.nan
-    )
+    # 2. クイズ・集計指標
+    quiz_correct = get_first_valid(df, "quiz_correct_count")
+    quiz_total = get_first_valid(df, "quiz_total_count")
+
+    # クイズ正答率・平均反応時間計算 (Showquiz 画面の試行データから)
+    quiz_df = df[df["sender"] == "Showquiz"] if "sender" in df.columns else pd.DataFrame()
+
+    if not quiz_df.empty and "correct" in quiz_df.columns:
+        # correct は boolean, 文字列 'true'/'false', 1/0 が混在するため厳密に判定
+        correct_series = quiz_df["correct"].astype(str).str.lower().str.strip()
+        is_correct = correct_series.isin(["true", "1", "1.0"])
+        quiz_acc = is_correct.mean()
+    else:
+        quiz_acc = np.nan
+
     quiz_avg_rt = (
-        quiz_df["duration"].mean()
+        pd.to_numeric(quiz_df["duration"], errors="coerce").mean()
         if not quiz_df.empty and "duration" in quiz_df.columns
         else np.nan
     )
@@ -83,16 +78,35 @@ def process_single_file(file):
         "condition": condition,
         "quiz_correct_count": quiz_correct,
         "quiz_total_count": quiz_total,
-        "quiz_accuracy": quiz_acc,
-        "quiz_avg_rt_ms": quiz_avg_rt,
+        "quiz_accuracy": round(quiz_acc, 4) if pd.notna(quiz_acc) else np.nan,
+        "quiz_avg_rt_ms": round(quiz_avg_rt, 2) if pd.notna(quiz_avg_rt) else np.nan,
     }
 
-    # アンケート等の追加項目（q1., q2., purposeなど）を抽出
+    # 3. 自由記述 (recall2) が複数項目存在する場合（ニュース1、ニュース2の再生記述など）
+    if "recall2" in df.columns:
+        recalls = df["recall2"].dropna().tolist()
+        recalls = [r for r in recalls if str(r).strip() != ""]
+        for idx, r_text in enumerate(recalls, start=1):
+            row_data[f"recall_text_{idx}"] = r_text
+
+    # 4. アンケート項目・追加質問（q1, q2, purpose, DV項目, comment など）の全自動抽出
+    ignore_cols = {
+        "sender", "sender_type", "sender_id", "timestamp", "meta", "duration",
+        "ended_on", "mean_rt", "time_commit", "time_end", "time_render", "time_run",
+        "time_show", "time_switch", "url", "participantID", "age", "sex", "condition",
+        "quiz_correct_count", "quiz_total_count", "correct", "recall2", "correctResponse",
+        "correct_count", "total_count", "response", "response_action", "seikai"
+    }
+
     for col in df.columns:
-        if col.startswith("q1.") or col.startswith("q2.") or col.startswith("purpose"):
-            vals = df[col].dropna().values
-            if len(vals) > 0:
-                row_data[col] = vals[0]
+        if col in ignore_cols:
+            continue
+
+        # 質問・回答系カラムの自動抽出
+        vals = df[col].dropna().values
+        valid_vals = [v for v in vals if pd.notna(v) and str(v).strip() != ""]
+        if len(valid_vals) > 0:
+            row_data[col] = valid_vals[0]
 
     return row_data
 
