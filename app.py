@@ -10,7 +10,7 @@ st.set_page_config(
 
 st.title("📊 lab.js 統計解析用データ結合アプリ")
 st.write(
-    "SPSS / R / Python / Jamovi 等での**統計分析（t検定、分散分析、相関・回帰分析）にそのまま使える完全クリーンなデータセット**（1被験者1行）を作成します。"
+    "SPSS / R / Python / Jamovi 等での**統計分析にそのまま使える完全ASCII英数字のクリーンなデータセット**（1被験者1行）を作成します。"
 )
 
 uploaded_files = st.file_uploader(
@@ -18,6 +18,31 @@ uploaded_files = st.file_uploader(
     type=["csv"],
     accept_multiple_files=True,
 )
+
+# 日本語ひらがな・カタカナからアルファベット（ローマ字）への変換辞書
+JAPANESE_TO_ROMAJI = {
+    "じゆう": "jiyuu", "いけん": "iken", "えんぜつ": "enzetsu", "はなしあい": "hanashiai",
+    "ばくは": "bakuha", "こんらん": "konran", "そうどう": "soudou", "がいこう": "gaikou",
+    "ほうもん": "houmon", "みさいる": "misairu", "せんかん": "senkan", "ぶりょく": "buryoku",
+    "からす": "karasu", "ちきゅう": "chikyuu", "さかな": "sakana", "いちご": "ichigo",
+    "ぬへちょ": "nuhecho", "みらぽん": "mirapon", "りんご": "ringo", "ぬぽり": "nupori",
+    "るちょ": "rucho", "まぴそ": "mapiso", "けむにん": "kemunin", "てぃらま": "tirama",
+    "ぱりく": "pariku", "とぱけこ": "topakeko", "むへろ": "muhero", "ふにょま": "funyoma"
+}
+
+
+def kana_to_romaji(text):
+    """日本語テキストを英数字（ASCIIローマ字）に変換"""
+    text_clean = text.strip()
+    if text_clean in JAPANESE_TO_ROMAJI:
+        return JAPANESE_TO_ROMAJI[text_clean]
+    
+    # 記号を除去し英数字のみ残す
+    safe_name = re.sub(r"[^\w]", "", text_clean)
+    # 非ASCII文字が含まれている場合はハッシュ値やインデックスを付与
+    if not safe_name.isascii():
+        safe_name = f"item_{abs(hash(text_clean)) % 10000}"
+    return safe_name.lower()
 
 
 def get_valid_numeric_attr(df, col_name, min_val=0, max_val=200):
@@ -47,13 +72,12 @@ def get_first_valid_text(df, col_name):
 
 def process_single_file_for_stats(file, row_index):
     """
-    1被験者分の lab.js CSV から、統計分析に必要な変数（IV, DV, 反応時間, 正誤, 尺度項目）
-    のみをシステムノイズ一切なしで綺麗に抽出する関数
+    1被験者分の lab.js CSV から、統計分析用の英字変数名（ASCII）でデータ抽出する関数
     """
     df = pd.read_csv(file)
     row = {}
 
-    # 1. 識別子 & 実験条件 (独立変数: IV) & 被験者属性
+    # 1. 識別子 & 実験条件 (IV) & 被験者属性
     row["id"] = row_index
 
     p_id = get_first_valid_text(df, "participantID")
@@ -69,8 +93,7 @@ def process_single_file_for_stats(file, row_index):
     row["sex"] = get_valid_numeric_attr(df, "sex", min_val=1, max_val=10)
     row["condition"] = get_valid_numeric_attr(df, "condition", min_val=1, max_val=100)
 
-    # 2. 質問紙尺度・アンケート項目 (従属変数: DV)
-    # q1_v1 〜 q1_v5, q2_v6 〜 q2_v10, purpose, comment など
+    # 2. 質問紙尺度・アンケート項目 (DV) -> 英数字変数名
     for col in df.columns:
         c_clean = col.replace(".-", "_").replace(".", "_").replace("-", "_")
         if any(c_clean.startswith(prefix) for prefix in ["q1_", "q2_", "purpose", "comment", "final_consent", "dv_"]):
@@ -109,7 +132,7 @@ def process_single_file_for_stats(file, row_index):
     else:
         row["ldt_mean_rt"] = np.nan
 
-    # 5. 各単語・試行レベルの反応時間 (rt_単語名) と 正誤 (corr_単語名: 1/0)
+    # 5. 各単語の反応時間 (rt_word_[romaji]) と 正誤 (corr_word_[romaji])
     if "worditem" in df.columns and "duration" in df.columns:
         word_rows = df[df["worditem"].notna() & (df["worditem"] != "")]
         for _, r in word_rows.iterrows():
@@ -117,24 +140,27 @@ def process_single_file_for_stats(file, row_index):
             if not w_item or w_item.lower() == "nan":
                 continue
             
-            w_safe = re.sub(r"[^\w]", "_", w_item)
+            # 日本語単語をローマ字（ASCII英数字）に自動変換
+            w_romaji = kana_to_romaji(w_item)
             
+            # 反応時間 (ms)
             dur = r.get("duration")
             if pd.notna(dur):
                 try:
-                    row[f"rt_word_{w_safe}"] = round(float(dur), 1)
+                    row[f"rt_word_{w_romaji}"] = round(float(dur), 1)
                 except Exception:
                     pass
             
+            # 正誤 (1 / 0)
             corr = str(r.get("correct", "")).lower().strip()
             ans_resp = str(r.get("response", "")).lower().strip()
             sk = str(r.get("seikai", "")).lower().strip()
             if corr in ["true", "1", "1.0"] or (ans_resp != "" and ans_resp == sk):
-                row[f"corr_word_{w_safe}"] = 1
+                row[f"corr_word_{w_romaji}"] = 1
             elif corr in ["false", "0", "0.0"]:
-                row[f"corr_word_{w_safe}"] = 0
+                row[f"corr_word_{w_romaji}"] = 0
 
-    # 6. クイズ各問の正誤 (quiz_q01 〜 quiz_qN: 1/0)
+    # 6. クイズ各問の正誤 (quiz_q01 〜 quiz_qN)
     if "itemNO" in df.columns and "sender" in df.columns:
         quiz_rows = df[df["sender"].str.contains("quiz", case=False, na=False) & df["itemNO"].notna()]
         for _, r in quiz_rows.iterrows():
@@ -159,7 +185,7 @@ def process_single_file_for_stats(file, row_index):
 if uploaded_files:
     st.success(f"{len(uploaded_files)} 個のファイルが読み込まれました。")
 
-    if st.button("📊 統計解析用データセットを作成する"):
+    if st.button("📊 統計解析用データセット（英字変数名）を作成する"):
         rows = []
         progress_bar = st.progress(0)
 
@@ -173,6 +199,7 @@ if uploaded_files:
 
         summary_df = pd.DataFrame(rows)
 
+        # 優先度の高い基本列を先頭に整理
         priority_order = [
             "id", "participantID", "age", "sex", "condition",
             "quiz_correct_count", "quiz_total_count", "quiz_accuracy",
@@ -182,11 +209,11 @@ if uploaded_files:
         other_cols = [c for c in summary_df.columns if c not in first_cols]
         summary_df = summary_df[first_cols + other_cols]
 
-        st.subheader("📊 統計解析用データセットのプレビュー（ノイズ除去・変数最適化済み）")
+        st.subheader("📊 統計解析用データセットプレビュー（全ASCII英数字変数名）")
         st.write(f"総被験者数 ($N$): **{len(summary_df)}** 人 / 分析変数（カラム数）: **{len(summary_df.columns)}** 変数")
         st.dataframe(summary_df.head(10))
 
-        # CSV化してダウンロード
+        # CSVダウンロード
         csv_data = summary_df.to_csv(index=False, encoding="utf-8-sig").encode(
             "utf-8-sig"
         )
