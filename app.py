@@ -29,7 +29,17 @@ st.write(
 # 1. 定数・標準システム列・ローマ字変換テーブル
 # ==============================================================================
 
-# lab.js が標準で出力するシステム列（そのままでは1被験者1列の属性にならない列）
+# lab.js の時間計測系システム列
+LABJS_TIME_COLS: List[str] = [
+    "time_run",
+    "time_render",
+    "time_show",
+    "time_end",
+    "time_commit",
+    "time_switch",
+]
+
+# lab.js が標準で全行に出力するシステム列
 LABJS_SYSTEM_COLS: Set[str] = {
     "sender",
     "sender_type",
@@ -40,13 +50,8 @@ LABJS_SYSTEM_COLS: Set[str] = {
     "response",
     "response_action",
     "correct",
-    "time_run",
-    "time_render",
-    "time_show",
-    "time_end",
-    "time_commit",
-    "time_switch",
     "url",
+    *LABJS_TIME_COLS,
 }
 
 # 被験者ID列の候補名（優先順）
@@ -203,7 +208,6 @@ def _builtin_kana_to_romaji(text: str) -> str:
     i = 0
     n = len(hira)
     while i < n:
-        # 促音「っ」: 次の子音を重ねる
         if hira[i] == "っ":
             if i + 1 < n:
                 next_two = hira[i + 1 : i + 3]
@@ -214,24 +218,20 @@ def _builtin_kana_to_romaji(text: str) -> str:
             i += 1
             continue
 
-        # 長音「ー」: 直前の母音を重ねるか省略
         if hira[i] == "ー":
             i += 1
             continue
 
-        # 2文字の拗音・外来音
         if i + 1 < n and hira[i : i + 2] in _KANA_DIGRAPHS:
             out.append(_KANA_DIGRAPHS[hira[i : i + 2]])
             i += 2
             continue
 
-        # 1文字のかな
         if hira[i] in _KANA_MONOGRAPHS:
             out.append(_KANA_MONOGRAPHS[hira[i]])
             i += 1
             continue
 
-        # その他（英数字等）はそのまま追加
         out.append(hira[i])
         i += 1
 
@@ -247,35 +247,31 @@ def to_ascii_var_name(text: str, use_romaji: bool = True) -> str:
         return "empty"
 
     if not use_romaji:
-        # ローマ字変換しない場合でも空白やドット等の記号はアンダースコアに整理
         cleaned = re.sub(r"[\.\-\s/\\:;,]+", "_", text_clean).strip("_")
         return cleaned if cleaned else "var"
 
-    # 1. 既知のカスタム辞書に完全一致する場合
     if text_clean in CUSTOM_ROMAJI_DICT:
         return CUSTOM_ROMAJI_DICT[text_clean]
 
-    # 2. かなのみで構成されている場合は内蔵テーブルで正確にローマ字化（外来音「てぃ」「ふにょ」等も正確）
     hira_check = _katakana_to_hiragana(text_clean)
     if all((0x3041 <= ord(c) <= 0x3096) or c == "ー" for c in hira_check):
         romaji_kana = _builtin_kana_to_romaji(text_clean)
         if romaji_kana.isascii() and romaji_kana.isalnum():
             return romaji_kana.lower()
 
-    # 3. 漢字等を含む場合は pykakasi でローマ字に変換
     converted = text_clean
     if not converted.isascii() and _KAKASI is not None:
         try:
             items = _KAKASI.convert(converted)
-            converted = "".join(item.get("hepburn", item.get("orig", "")) for item in items)
+            converted = "".join(
+                item.get("hepburn", item.get("orig", "")) for item in items
+            )
         except Exception:
             pass
 
-    # 4. 残ったかな文字を内蔵コンバータで変換
     if not converted.isascii():
         converted = _builtin_kana_to_romaji(converted)
 
-    # 記号をアンダースコアに置換し、ASCII英数字とアンダースコアのみ残す
     converted = re.sub(r"[\.\-\s/\\:;,]+", "_", converted)
     safe_name = re.sub(r"[^0-9a-zA-Z_]", "", converted)
     safe_name = re.sub(r"_+", "_", safe_name).strip("_")
@@ -291,7 +287,7 @@ def to_ascii_var_name(text: str, use_romaji: bool = True) -> str:
 
 
 def is_system_col(col_name: str) -> bool:
-    """lab.jsのシステム列かどうかを判定"""
+    """lab.jsの標準システム列かどうかを判定（実験者独自の `time_video` 等は除外しない）"""
     c = str(col_name).strip()
     if c in LABJS_SYSTEM_COLS:
         return True
@@ -330,11 +326,13 @@ def parse_scalar_value(val):
 @st.cache_data(show_spinner=False)
 def analyze_uploaded_files(file_bytes_list: List[Tuple[str, bytes]]) -> Dict:
     """
-    アップロードされた全CSVファイルをスキャンし、各列の性質を自動分類する
+    アップロードされた全CSVファイルをスキャンし、各列および画面（sender）の性質を自動分類する
     """
     all_cols: List[str] = []
     col_set: Set[str] = set()
     dfs: List[Tuple[str, pd.DataFrame]] = []
+    sender_names: List[str] = []
+    sender_set: Set[str] = set()
 
     for fname, bdata in file_bytes_list:
         try:
@@ -344,6 +342,11 @@ def analyze_uploaded_files(file_bytes_list: List[Tuple[str, bytes]]) -> Dict:
                 if c not in col_set:
                     col_set.add(c)
                     all_cols.append(c)
+            if "sender" in df.columns:
+                for s_val in get_valid_series(df, "sender").astype(str).str.strip():
+                    if s_val not in sender_set:
+                        sender_set.add(s_val)
+                        sender_names.append(s_val)
         except Exception:
             pass
 
@@ -352,12 +355,12 @@ def analyze_uploaded_files(file_bytes_list: List[Tuple[str, bytes]]) -> Dict:
     multi_val_cols: List[str] = []
     trial_key_cols: List[str] = []
     empty_cols: List[str] = []
+    present_time_cols: List[str] = [c for c in LABJS_TIME_COLS if c in col_set]
 
     # 被験者ID列の自動検出
     detected_id_col = "（ファイル名を使用）"
     for cand in PARTICIPANT_ID_CANDIDATES:
         if cand in col_set:
-            # 実際に値が入っているか確認
             has_val = any(not get_valid_series(df, cand).empty for _, df in dfs)
             if has_val:
                 detected_id_col = cand
@@ -393,7 +396,6 @@ def analyze_uploaded_files(file_bytes_list: List[Tuple[str, bytes]]) -> Dict:
                 max_distinct_vals = max(max_distinct_vals, n_unique)
 
                 if n_rows > 1 and n_unique > 1:
-                    # 同じ行に duration や response / correct があるかチェック
                     sub_df = df.loc[valid_s.index]
                     for sys_c in ["duration", "response", "correct"]:
                         if sys_c in sub_df.columns and sub_df[sys_c].notna().any():
@@ -410,7 +412,6 @@ def analyze_uploaded_files(file_bytes_list: List[Tuple[str, bytes]]) -> Dict:
         )
         is_free_text_hint = any(h in col_lower for h in FREE_TEXT_NAME_HINTS)
 
-        # 1被験者内で複数の異なる値を持つ列の振り分け
         if max_valid_rows > 1 and max_distinct_vals > 1:
             if is_trial_hint or (co_occurs_with_rt_or_resp and not is_free_text_hint):
                 trial_key_cols.append(col)
@@ -423,6 +424,8 @@ def analyze_uploaded_files(file_bytes_list: List[Tuple[str, bytes]]) -> Dict:
         "all_cols": all_cols,
         "system_cols": system_cols,
         "empty_cols": empty_cols,
+        "present_time_cols": present_time_cols,
+        "sender_names": sender_names,
         "detected_id_col": detected_id_col,
         "detected_answer_col": detected_answer_col,
         "single_val_cols": single_val_cols,
@@ -436,7 +439,6 @@ def evaluate_trial_correctness(
 ) -> Optional[int]:
     """
     1試行の正誤を 1 (正解) / 0 (不正解) / None (判定不能) で返す。
-    lab.js 標準の `correct` 列と、`response == 正解列` の両方に対応。
     """
     corr_raw = str(row_series.get("correct", "")).lower().strip()
     resp_raw = str(row_series.get("response", "")).lower().strip()
@@ -463,9 +465,6 @@ def extract_single_value(
 ):
     """
     1被験者につき1つの値を取り出す。
-    - strategy == "last_non_zero": 最後の有効値（ただし0以外の有効値があればそちらを優先）
-    - strategy == "first": 最初の有効値
-    - strategy == "last": 最後の有効値
     """
     valid_s = get_valid_series(df, col_name)
     if valid_s.empty:
@@ -481,9 +480,6 @@ def extract_single_value(
     if strategy == "last":
         return parsed_vals[-1]
 
-    # デフォルト ("last_non_zero"):
-    # lab.js では初期値 0 が前の行に入り、後の行で実際の値が入るケースが多いため、
-    # 0 以外の値が存在すれば最後の非ゼロ値を返し、すべて 0 なら 0 を返す
     non_zero_vals = [v for v in parsed_vals if v != 0 and v != "0"]
     if non_zero_vals:
         return non_zero_vals[-1]
@@ -509,8 +505,12 @@ def process_participant_df(
     include_trial_rt: bool,
     include_trial_corr: bool,
     include_trial_resp: bool,
+    trial_time_cols: List[str],
     calc_task_summary: bool,
     include_file_name: bool,
+    include_overall_timing: bool,
+    selected_senders_for_time: List[str],
+    sender_time_metrics: List[str],
 ) -> Dict:
     row: Dict = {}
 
@@ -528,12 +528,35 @@ def process_participant_df(
     else:
         row["participantID"] = file_name
 
+    # 1b. 実験全体の時間データ（開始・終了時刻、総所要時間、最終行の time_*）
+    if include_overall_timing:
+        ts_series = get_valid_series(df, "timestamp")
+        if not ts_series.empty:
+            row["start_timestamp"] = str(ts_series.iloc[0])
+            row["end_timestamp"] = str(ts_series.iloc[-1])
+
+        # 総所要時間 (ms / sec): time_end または time_commit の最大値、なければ duration の合計
+        total_ms = None
+        for t_col in ["time_end", "time_commit", "time_switch"]:
+            if t_col in df.columns:
+                num_s = pd.to_numeric(df[t_col], errors="coerce").dropna()
+                if not num_s.empty:
+                    total_ms = float(num_s.max())
+                    break
+        if total_ms is None and "duration" in df.columns:
+            num_d = pd.to_numeric(df["duration"], errors="coerce").dropna()
+            if not num_d.empty:
+                total_ms = float(num_d.sum())
+
+        if total_ms is not None:
+            row["total_duration_ms"] = round(total_ms, 1)
+            row["total_duration_sec"] = round(total_ms / 1000.0, 2)
+
     # 2. 単一値列（アンケート・属性・実験条件・既存集計値）の抽出
     for col in single_cols:
         if col == id_col:
             continue
         var_name = to_ascii_var_name(col, use_romaji=use_romaji)
-        # すでに participantID として格納済みならスキップ
         if var_name.lower() == "participantid" and "participantID" in row:
             continue
         row[var_name] = extract_single_value(df, col, strategy=single_strategy)
@@ -555,6 +578,30 @@ def process_participant_df(
         ):
             row["quiz_accuracy"] = round((qc / qt) * 100, 2)
 
+    # 2b. 指定された画面（sender）ごとの滞在時間 (duration) や time_* の抽出
+    if selected_senders_for_time and "sender" in df.columns and sender_time_metrics:
+        for s_name in selected_senders_for_time:
+            s_rows = df[df["sender"].astype(str).str.strip() == s_name]
+            if s_rows.empty:
+                continue
+            s_clean = to_ascii_var_name(s_name, use_romaji=use_romaji)
+            for m_col in sender_time_metrics:
+                if m_col not in s_rows.columns:
+                    continue
+                num_vals = pd.to_numeric(s_rows[m_col], errors="coerce").dropna()
+                if num_vals.empty:
+                    continue
+                if len(num_vals) == 1:
+                    row[f"{m_col}_{s_clean}"] = round(float(num_vals.iloc[0]), 1)
+                else:
+                    # 同じ sender 名が複数行ある場合（ループ等）は合計(duration)または最終値(time_*)と平均を出力
+                    if m_col == "duration":
+                        row[f"duration_sum_{s_clean}"] = round(float(num_vals.sum()), 1)
+                        row[f"duration_mean_{s_clean}"] = round(float(num_vals.mean()), 1)
+                    else:
+                        row[f"{m_col}_first_{s_clean}"] = round(float(num_vals.iloc[0]), 1)
+                        row[f"{m_col}_last_{s_clean}"] = round(float(num_vals.iloc[-1]), 1)
+
     # 3. 複数回答列（自由記述・再生課題など）の連番展開 (`列名_1`, `列名_2`...)
     for col in multi_cols:
         if col not in df.columns:
@@ -565,19 +612,17 @@ def process_participant_df(
             row[f"{base_name}_{idx}"] = parse_scalar_value(val)
 
     # 4. 課題（トライアル）キー列ごとの横展開 ＆ 課題集計
-    # 複数のキー列（例: worditem と itemNO）が同じ行に共存する場合、
-    # より具体的な刺激列（非数値の刺激列など）を先に処理し、同じ行の重複展開を防ぐ
     used_row_indices: Set[int] = set()
 
-    # 非数値の刺激キー列（例: worditem）を数値連番キー列（例: itemNO）より先に処理する
     def _key_sort_priority(k: str) -> int:
         if k not in df.columns:
             return 99
         s = get_valid_series(df, k)
         if s.empty:
             return 99
-        # すべて数値なら後回し（itemNOなど）
-        all_num = all(isinstance(parse_scalar_value(v), (int, float)) for v in s.head(10))
+        all_num = all(
+            isinstance(parse_scalar_value(v), (int, float)) for v in s.head(10)
+        )
         return 1 if all_num else 0
 
     sorted_trial_keys = sorted(trial_key_cols, key=_key_sort_priority)
@@ -590,8 +635,9 @@ def process_participant_df(
         if valid_s.empty:
             continue
 
-        # すでに別の試行キー列（例: worditem）で処理された行は除外
-        remaining_indices = [idx for idx in valid_s.index if idx not in used_row_indices]
+        remaining_indices = [
+            idx for idx in valid_s.index if idx not in used_row_indices
+        ]
         if not remaining_indices:
             continue
 
@@ -599,10 +645,12 @@ def process_participant_df(
         used_row_indices.update(remaining_indices)
 
         key_col_clean = to_ascii_var_name(key_col, use_romaji=use_romaji)
-        # プレフィックスの決定（worditem -> word, itemNO + senderにquiz -> quiz 等）
         has_quiz_sender = (
             "sender" in trial_rows.columns
-            and trial_rows["sender"].astype(str).str.contains("quiz", case=False, na=False).any()
+            and trial_rows["sender"]
+            .astype(str)
+            .str.contains("quiz", case=False, na=False)
+            .any()
         )
         if key_col.lower() == "worditem":
             prefix_label = "word"
@@ -620,9 +668,15 @@ def process_participant_df(
             parsed_key = parse_scalar_value(raw_key_val)
 
             if isinstance(parsed_key, int):
-                item_suffix = f"q{parsed_key:02d}" if prefix_label == "quiz" else f"{parsed_key:02d}"
+                item_suffix = (
+                    f"q{parsed_key:02d}"
+                    if prefix_label == "quiz"
+                    else f"{parsed_key:02d}"
+                )
             else:
-                item_suffix = to_ascii_var_name(str(raw_key_val), use_romaji=use_romaji)
+                item_suffix = to_ascii_var_name(
+                    str(raw_key_val), use_romaji=use_romaji
+                )
 
             # (a) 反応時間 (duration)
             rt_val = None
@@ -641,8 +695,11 @@ def process_participant_df(
                     task_correct_rts.append(rt_val)
 
             # (c) 個別試行カラムへの書き出し
-            if prefix_label == "quiz" and key_col.lower() in ["itemno", "item_no", "item"]:
-                # クイズ形式 (quiz_q01, rt_quiz_q01)
+            if prefix_label == "quiz" and key_col.lower() in [
+                "itemno",
+                "item_no",
+                "item",
+            ]:
                 if include_trial_corr and corr_val is not None:
                     row[f"quiz_{item_suffix}"] = corr_val
                 if include_trial_rt and rt_val is not None:
@@ -659,7 +716,17 @@ def process_participant_df(
                         r["response"]
                     )
 
-        # (d) 課題全体の自動集計指標（正答数・総数・正答率・平均RT）
+            # (d) 各試行の time_* データ（選択された場合）
+            for t_col in trial_time_cols:
+                if t_col in r and pd.notna(r[t_col]):
+                    try:
+                        row[f"{t_col}_{prefix_label}_{item_suffix}"] = round(
+                            float(r[t_col]), 1
+                        )
+                    except (ValueError, TypeError):
+                        pass
+
+        # (e) 課題全体の自動集計指標（正答数・総数・正答率・平均RT）
         if calc_task_summary:
             if task_corrs:
                 c_cnt = int(sum(task_corrs))
@@ -694,14 +761,15 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     st.success(f"✅ {len(uploaded_files)} 個のCSVファイルが読み込まれました。")
 
-    # キャッシュ解析用にバイト列を取得
     file_bytes_list = [(f.name, f.getvalue()) for f in uploaded_files]
     analysis = analyze_uploaded_files(file_bytes_list)
     all_non_empty_cols = [
         c for c in analysis["all_cols"] if c not in analysis["empty_cols"]
     ]
 
-    with st.expander("⚙️ 抽出・展開ルールの確認とカスタマイズ（自動検出済み）", expanded=True):
+    with st.expander(
+        "⚙️ 抽出・展開ルールの確認とカスタマイズ（自動検出済み）", expanded=True
+    ):
         st.caption(
             "アップロードされたCSVの列構造を自動解析しました。そのまま下の作成ボタンを押すか、必要に応じて設定を調整してください。"
         )
@@ -761,6 +829,11 @@ if uploaded_files:
                 "📄 元のCSVファイル名 (`file_name`) 列も出力する",
                 value=False,
             )
+            include_overall_timing = st.checkbox(
+                "🕒 実験全体の開始・終了日時 (`timestamp`) と総所要時間 (`total_duration_sec`) を出力する",
+                value=True,
+                help="最終行の `time_end` / `time_commit` 等から実験全体の所要時間（ミリ秒・秒）を自動算出し、不良回答スクリーニングに使えます。",
+            )
             calc_task_summary = st.checkbox(
                 "📈 課題ごとの正答率・平均RT（全体／正答のみ）を自動計算して追加する",
                 value=True,
@@ -780,7 +853,7 @@ if uploaded_files:
             "📌 単一値として抽出する列（アンケート・属性・実験条件・既存集計スコアなど：1被験者1列）",
             options=all_non_empty_cols,
             default=analysis["single_val_cols"],
-            help="1被験者につき1つの値を持つ列です。システム列以外のすべての質問項目・属性列が自動選択されています。",
+            help="1被験者につき1つの値を持つ列です。もし `time_end` 等の最終値だけを1列として取り出したい場合はここに追加することもできます。",
         )
 
         selected_multi_cols = st.multiselect(
@@ -797,7 +870,62 @@ if uploaded_files:
             help="刺激語（例: `worditem`）や問題番号（例: `itemNO`）の列を指定すると、各刺激・各問ごとの反応時間や正誤を横展開します。",
         )
 
-    if st.button("📊 統計解析用ワイドデータセット（1被験者1行）を作成する", type="primary"):
+        # 🕒 詳細な time_* / 画面別滞在時間の設定
+        st.markdown("##### 🕒 `time_*` データ・画面（`sender`）別の所要時間の詳細抽出")
+        show_time_legend = st.checkbox(
+            "📖 時間変数（`time_*` / `duration` / `timestamp`）の意味・凡例を表示する",
+            value=True,
+        )
+        if show_time_legend:
+            st.info(
+                """
+**⏱️ lab.js における1画面（1コンポーネント）の時間経過イメージ**
+`time_run` ➔ `time_render` ➔ **`time_show` ──( 画面表示中：`duration` )──▶ `time_end`** ➔ `time_commit` ➔ `time_switch`
+
+| 変数名 | 単位 | 意味・タイミング | 主な分析用途 |
+| :--- | :---: | :--- | :--- |
+| **`duration`** | ms (ミリ秒) | **画面滞在時間・反応時間**（`≈ time_end - time_show`） | **最重要**：課題の反応時間（RT）や、映像・教示・質問紙画面の滞在時間チェック |
+| **`timestamp`** | 日時 (ISO) | その画面が終了・記録された実世界の時計の日時 | 実験の実施時間帯の確認、開始〜終了時刻の把握 |
+| **`time_run`** | ms (実験開始から) | コンポーネントの内部処理（スクリプト実行）が開始された時点 | プログラム上のコンポーネント起動タイミングの確認 |
+| **`time_render`** | ms (実験開始から) | 画面のHTML/Canvasが組み立てられ、ブラウザ描画が要求された時点 | 描画準備にかかった時間の検証 |
+| **`time_show`** | ms (実験開始から) | **実際に画面上に刺激が表示された時点**（フレーム描画完了） | 刺激呈示の正確な開始タイミングの確認（`time_show - time_render` で描画遅延を確認可） |
+| **`time_end`** | ms (実験開始から) | **応答（キー/クリック）や制限時間により画面が終了した時点** | 各画面の終了タイミング。**最終行の `time_end` ＝ 実験全体の総所要時間** |
+| **`time_commit`** | ms (実験開始から) | その画面の回答データが内部データストアに保存（commit）された時点 | データ記録完了タイミングの確認 |
+| **`time_switch`** | ms (実験開始から) | 次の画面（コンポーネント）への切り替えが完了した時点 | 画面遷移のオーバーヘッド確認 |
+
+- **本ツールが自動算出する全体指標**: `total_duration_sec` / `total_duration_ms`（実験全体の総所要時間：不良回答スクリーニング用）、`start_timestamp` / `end_timestamp`（実験開始・終了日時）
+"""
+            )
+
+        time_col_left, time_col_right = st.columns(2)
+        with time_col_left:
+            selected_senders_for_time = st.multiselect(
+                "🖥️ 画面（`sender`）ごとに滞在時間や `time_*` を抽出する画面名（任意）",
+                options=analysis["sender_names"],
+                default=[],
+                help="例えば映像視聴画面や教示画面・アンケート画面の `sender` 名を選択すると、その画面の滞在時間 (`duration`) や `time_*` を被験者ごとに抽出します。",
+            )
+            sender_time_metrics = st.multiselect(
+                "↪ 選択した画面（`sender`）で出力する時間指標",
+                options=["duration"] + analysis["present_time_cols"],
+                default=(
+                    ["duration", "time_show", "time_end"]
+                    if "time_show" in analysis["present_time_cols"]
+                    else ["duration"]
+                ),
+            )
+        with time_col_right:
+            trial_time_cols = st.multiselect(
+                "⏱️ 各試行（トライアル）ごとに追加出力する `time_*` 列（任意）",
+                options=analysis["present_time_cols"],
+                default=[],
+                help="試行ごとの `duration`（反応時間）に加えて、各試行の `time_show`, `time_end`, `time_commit` 等も出力したい場合に選択してください。",
+            )
+
+
+    if st.button(
+        "📊 統計解析用ワイドデータセット（1被験者1行）を作成する", type="primary"
+    ):
         rows = []
         progress_bar = st.progress(0)
         ans_col_arg = (
@@ -823,8 +951,12 @@ if uploaded_files:
                     include_trial_rt=include_trial_rt,
                     include_trial_corr=include_trial_corr,
                     include_trial_resp=include_trial_resp,
+                    trial_time_cols=trial_time_cols,
                     calc_task_summary=calc_task_summary,
                     include_file_name=include_file_name,
+                    include_overall_timing=include_overall_timing,
+                    selected_senders_for_time=selected_senders_for_time,
+                    sender_time_metrics=sender_time_metrics,
                 )
                 rows.append(row)
             except Exception as e:
@@ -843,6 +975,10 @@ if uploaded_files:
             "gender",
             "condition",
             "group",
+            "total_duration_sec",
+            "total_duration_ms",
+            "start_timestamp",
+            "end_timestamp",
         ]
         first_cols = [c for c in priority_order if c in summary_df.columns]
         other_cols = [c for c in summary_df.columns if c not in first_cols]
