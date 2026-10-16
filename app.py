@@ -45,6 +45,7 @@ LABJS_SYSTEM_COLS: Set[str] = {
     "sender_type",
     "sender_id",
     "timestamp",
+    "meta",
     "duration",
     "ended_on",
     "response",
@@ -511,6 +512,7 @@ def process_participant_df(
     include_overall_timing: bool,
     selected_senders_for_time: List[str],
     sender_time_metrics: List[str],
+    extract_sender_responses: bool = True,
 ) -> Dict:
     row: Dict = {}
 
@@ -745,7 +747,90 @@ def process_participant_df(
                     round(float(np.mean(task_correct_rts)), 2),
                 )
 
+    # 5. 試行キー列を持たない `response` 行（canvas.Screen のボタンクリック回答など）を `sender` 名で自動抽出
+    if extract_sender_responses and "response" in df.columns and "sender" in df.columns:
+        resp_s = get_valid_series(df, "response")
+        rem_resp_indices = [
+            idx for idx in resp_s.index if idx not in used_row_indices
+        ]
+        if rem_resp_indices:
+            resp_rows = df.loc[rem_resp_indices]
+            # 同じ sender 名が複数回出現するかカウント
+            sender_counts: Dict[str, int] = {}
+            for _, r in resp_rows.iterrows():
+                s_raw = str(r.get("sender", "screen")).strip()
+                s_clean = to_ascii_var_name(s_raw, use_romaji=use_romaji)
+                sender_counts[s_clean] = sender_counts.get(s_clean, 0) + 1
+
+            sender_seen: Dict[str, int] = {}
+            for _, r in resp_rows.iterrows():
+                s_raw = str(r.get("sender", "screen")).strip()
+                s_clean = to_ascii_var_name(s_raw, use_romaji=use_romaji)
+                sender_seen[s_clean] = sender_seen.get(s_clean, 0) + 1
+
+                if sender_counts[s_clean] > 1:
+                    var_label = f"{s_clean}_{sender_seen[s_clean]:02d}"
+                else:
+                    var_label = s_clean
+
+                # 回答値
+                row[var_label] = parse_scalar_value(r["response"])
+
+                # 反応時間 (duration)
+                if include_trial_rt and "duration" in r and pd.notna(r["duration"]):
+                    try:
+                        row[f"rt_{var_label}"] = round(float(r["duration"]), 1)
+                    except (ValueError, TypeError):
+                        pass
+
+                # 正誤 (存在する場合)
+                corr_val = evaluate_trial_correctness(r, answer_col)
+                if include_trial_corr and corr_val is not None:
+                    row[f"corr_{var_label}"] = corr_val
+
+                # 追加の time_* 列
+                for t_col in trial_time_cols:
+                    if t_col in r and pd.notna(r[t_col]):
+                        try:
+                            row[f"{t_col}_{var_label}"] = round(float(r[t_col]), 1)
+                        except (ValueError, TypeError):
+                            pass
+
+    # 6. HTMLフォームで name 属性が空欄（Unnamed: * 列）だった入力値の救出（その行の sender 名を変数名として補完）
+    for col in df.columns:
+        if str(col).startswith("Unnamed:"):
+            valid_u = get_valid_series(df, col)
+            for idx, val in valid_u.items():
+                s_raw = (
+                    str(df.loc[idx, "sender"]).strip()
+                    if "sender" in df.columns and pd.notna(df.loc[idx, "sender"])
+                    else col
+                )
+                s_clean = to_ascii_var_name(s_raw, use_romaji=use_romaji)
+                row.setdefault(s_clean, parse_scalar_value(val))
+
     return row
+
+
+def _natural_col_sort_key(col_name: str) -> Tuple:
+    """
+    ランダム呈示された刺激列（SNS2, SNS3, SNS1... 等）を番号順（SNS1, SNS2, SNS3...）に並べ、
+    かつ本回答列の後ろに rt_* / corr_* / time_* 列がまとまるようにソートキーを生成する
+    """
+    if col_name.startswith("rt_"):
+        group = 1
+    elif col_name.startswith("corr_"):
+        group = 2
+    elif any(col_name.startswith(f"{tc}_") for tc in LABJS_TIME_COLS) or col_name.startswith("duration_"):
+        group = 3
+    else:
+        group = 0
+
+    parts = [
+        int(tok) if tok.isdigit() else tok.lower()
+        for tok in re.split(r"(\d+)", col_name)
+    ]
+    return (group, parts)
 
 
 # ==============================================================================
@@ -825,6 +910,11 @@ if uploaded_files:
                 value=True,
                 help="SPSS / R / Jamovi 等で文字化けや変数名エラーが起きないよう、ひらがな・カタカナ・漢字をローマ字に変換し記号を `_` に統一します。",
             )
+            extract_sender_responses = st.checkbox(
+                "🖱️ 画面ごとのクリック・キー回答（`sender` × `response`列）を自動抽出する",
+                value=True,
+                help="`canvas.Screen` のボタンクリック等で `response` 列に記録された回答（例: `SNS1_reliability`, `SNS1_buy` 等）を画面名ごとに1列ずつ抽出します。",
+            )
             include_file_name = st.checkbox(
                 "📄 元のCSVファイル名 (`file_name`) 列も出力する",
                 value=False,
@@ -845,7 +935,7 @@ if uploaded_files:
             with t_col2:
                 include_trial_corr = st.checkbox("⭕ 試行ごとの正誤", value=True)
             with t_col3:
-                include_trial_resp = st.checkbox("💬 試行ごとの回答値", value=False)
+                include_trial_resp = st.checkbox("💬 試行キーの回答値", value=False)
 
         st.divider()
 
@@ -922,7 +1012,6 @@ if uploaded_files:
                 help="試行ごとの `duration`（反応時間）に加えて、各試行の `time_show`, `time_end`, `time_commit` 等も出力したい場合に選択してください。",
             )
 
-
     if st.button(
         "📊 統計解析用ワイドデータセット（1被験者1行）を作成する", type="primary"
     ):
@@ -957,6 +1046,7 @@ if uploaded_files:
                     include_overall_timing=include_overall_timing,
                     selected_senders_for_time=selected_senders_for_time,
                     sender_time_metrics=sender_time_metrics,
+                    extract_sender_responses=extract_sender_responses,
                 )
                 rows.append(row)
             except Exception as e:
@@ -965,7 +1055,7 @@ if uploaded_files:
 
         summary_df = pd.DataFrame(rows)
 
-        # 優先度の高い基本列を先頭に整理
+        # 優先度の高い基本列を先頭に整理し、残りの列は番号順（SNS1, SNS2...）に自然ソート
         priority_order = [
             "id",
             "file_name",
@@ -981,7 +1071,10 @@ if uploaded_files:
             "end_timestamp",
         ]
         first_cols = [c for c in priority_order if c in summary_df.columns]
-        other_cols = [c for c in summary_df.columns if c not in first_cols]
+        other_cols = sorted(
+            [c for c in summary_df.columns if c not in first_cols],
+            key=_natural_col_sort_key,
+        )
         summary_df = summary_df[first_cols + other_cols]
 
         st.subheader("📊 データセットプレビュー（1被験者1行・ワイド形式）")
@@ -1002,3 +1095,4 @@ if uploaded_files:
             mime="text/csv",
             type="primary",
         )
+
