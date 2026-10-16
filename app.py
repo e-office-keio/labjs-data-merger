@@ -1,219 +1,861 @@
 import io
 import re
+import unicodedata
+from typing import Dict, List, Optional, Set, Tuple
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+try:
+    import pykakasi
+
+    _KAKASI = pykakasi.kakasi()
+except Exception:
+    _KAKASI = None
+
 st.set_page_config(
-    page_title="lab.js 統計解析用データ結合ツール", layout="wide"
+    page_title="lab.js 汎用データ結合・統計解析用整形ツール", layout="wide"
 )
 
-st.title("📊 lab.js 統計解析用データ結合アプリ")
+st.title("📊 lab.js 汎用データ結合・統計解析用整形アプリ")
 st.write(
-    "SPSS / R / Python / Jamovi 等での**統計分析にそのまま使える完全ASCII英数字のクリーンなデータセット**（1被験者1行）を作成します。"
+    "任意の **lab.js** 実験で収集した複数のCSVファイルを一括アップロードし、"
+    "SPSS / R / Python / Jamovi / JASP 等での統計分析にそのまま使える"
+    "**ワイド形式（1被験者1行）**のデータセットに自動整形します。"
 )
 
-uploaded_files = st.file_uploader(
-    "lab.js の CSV ファイルを選択、またはドラッグ＆ドロップしてください",
-    type=["csv"],
-    accept_multiple_files=True,
+# ==============================================================================
+# 1. 定数・標準システム列・ローマ字変換テーブル
+# ==============================================================================
+
+# lab.js が標準で出力するシステム列（そのままでは1被験者1列の属性にならない列）
+LABJS_SYSTEM_COLS: Set[str] = {
+    "sender",
+    "sender_type",
+    "sender_id",
+    "timestamp",
+    "duration",
+    "ended_on",
+    "response",
+    "response_action",
+    "correct",
+    "time_run",
+    "time_render",
+    "time_show",
+    "time_end",
+    "time_commit",
+    "time_switch",
+    "url",
+}
+
+# 被験者ID列の候補名（優先順）
+PARTICIPANT_ID_CANDIDATES: List[str] = [
+    "participantID",
+    "participant_id",
+    "participantId",
+    "participant",
+    "sub_id",
+    "subject_id",
+    "subject",
+    "userid",
+    "user_id",
+    "id",
+    "code",
+]
+
+# 正解キーが入っている列の候補名
+CORRECT_ANSWER_COL_CANDIDATES: List[str] = [
+    "seikai",
+    "correct_response",
+    "correct_answer",
+    "answer",
+    "ans",
+    "target_response",
+]
+
+# 試行（トライアル）の識別キーになりやすい列名パターン
+TRIAL_KEY_NAME_HINTS: Set[str] = {
+    "worditem",
+    "word_item",
+    "word",
+    "itemno",
+    "item_no",
+    "item_id",
+    "itemid",
+    "item",
+    "stimulus",
+    "stim",
+    "stim_id",
+    "trial_id",
+    "trial_no",
+    "trial",
+    "question_id",
+    "q_no",
+}
+
+# 自由記述・複数回答になりやすい列名パターン（試行キーから除外するヒント）
+FREE_TEXT_NAME_HINTS: Tuple[str, ...] = (
+    "recall",
+    "free",
+    "comment",
+    "opinion",
+    "thought",
+    "impression",
+    "feedback",
+    "purpose",
+    "memo",
+    "note",
+    "reason",
 )
 
-# 日本語ひらがな・カタカナからアルファベット（ローマ字）への変換辞書
-JAPANESE_TO_ROMAJI = {
-    "じゆう": "jiyuu", "いけん": "iken", "えんぜつ": "enzetsu", "はなしあい": "hanashiai",
-    "ばくは": "bakuha", "こんらん": "konran", "そうどう": "soudou", "がいこう": "gaikou",
-    "ほうもん": "houmon", "みさいる": "misairu", "せんかん": "senkan", "ぶりょく": "buryoku",
-    "からす": "karasu", "ちきゅう": "chikyuu", "さかな": "sakana", "いちご": "ichigo",
-    "ぬへちょ": "nuhecho", "みらぽん": "mirapon", "りんご": "ringo", "ぬぽり": "nupori",
-    "るちょ": "rucho", "まぴそ": "mapiso", "けむにん": "kemunin", "てぃらま": "tirama",
-    "ぱりく": "pariku", "とぱけこ": "topakeko", "むへろ": "muhero", "ふにょま": "funyoma"
+# 既存実験の単語辞書（優先適用）
+CUSTOM_ROMAJI_DICT: Dict[str, str] = {
+    "じゆう": "jiyuu",
+    "いけん": "iken",
+    "えんぜつ": "enzetsu",
+    "はなしあい": "hanashiai",
+    "ばくは": "bakuha",
+    "こんらん": "konran",
+    "そうどう": "soudou",
+    "がいこう": "gaikou",
+    "ほうもん": "houmon",
+    "みさいる": "misairu",
+    "せんかん": "senkan",
+    "ぶりょく": "buryoku",
+    "からす": "karasu",
+    "ちきゅう": "chikyuu",
+    "さかな": "sakana",
+    "いちご": "ichigo",
+    "ぬへちょ": "nuhecho",
+    "みらぽん": "mirapon",
+    "りんご": "ringo",
+    "ぬぽり": "nupori",
+    "るちょ": "rucho",
+    "まぴそ": "mapiso",
+    "けむにん": "kemunin",
+    "てぃらま": "tirama",
+    "ぱりく": "pariku",
+    "とぱけこ": "topakeko",
+    "むへろ": "muhero",
+    "ふにょま": "funyoma",
+}
+
+# 汎用ひらがな→ローマ字変換テーブル（拗音・外来音・濁音・半濁音・五十音）
+_KANA_DIGRAPHS: Dict[str, str] = {
+    "きゃ": "kya", "きゅ": "kyu", "きょ": "kyo",
+    "しゃ": "sha", "しゅ": "shu", "しょ": "sho",
+    "ちゃ": "cha", "ちゅ": "chu", "ちょ": "cho",
+    "にゃ": "nya", "にゅ": "nyu", "にょ": "nyo",
+    "ひゃ": "hya", "ひゅ": "hyu", "ひょ": "hyo",
+    "みゃ": "mya", "みゅ": "myu", "みょ": "myo",
+    "りゃ": "rya", "りゅ": "ryu", "りょ": "ryo",
+    "ぎゃ": "gya", "ぎゅ": "gyu", "ぎょ": "gyo",
+    "じゃ": "ja",  "じゅ": "ju",  "じょ": "jo",
+    "びゃ": "bya", "びゅ": "byu", "びょ": "byo",
+    "ぴゃ": "pya", "ぴゅ": "pyu", "ぴょ": "pyo",
+    "てぃ": "ti",  "でぃ": "di",  "とぅ": "tu",  "どぅ": "du",
+    "ふぁ": "fa",  "ふぃ": "fi",  "ふぇ": "fe",  "ふぉ": "fo", "ふゅ": "fyu",
+    "うぃ": "wi",  "うぇ": "we",  "うぉ": "wo",
+    "ゔぁ": "va",  "ゔぃ": "vi",  "ゔぇ": "ve",  "ゔぉ": "vo", "ゔゅ": "vyu",
+    "しぇ": "she", "じぇ": "je",  "ちぇ": "che",
+    "つぁ": "tsa", "つぃ": "tsi", "つぇ": "tse", "つぉ": "tso",
+}
+
+_KANA_MONOGRAPHS: Dict[str, str] = {
+    "あ": "a",  "い": "i",  "う": "u",  "え": "e",  "お": "o",
+    "か": "ka", "き": "ki", "く": "ku", "け": "ke", "こ": "ko",
+    "さ": "sa", "し": "shi", "す": "su", "せ": "se", "そ": "so",
+    "た": "ta", "ち": "chi", "つ": "tsu", "て": "te", "と": "to",
+    "な": "na", "に": "ni", "ぬ": "nu", "ね": "ne", "の": "no",
+    "は": "ha", "ひ": "hi", "ふ": "fu", "へ": "he", "ほ": "ho",
+    "ま": "ma", "み": "mi", "む": "mu", "め": "me", "も": "mo",
+    "や": "ya", "ゆ": "yu", "よ": "yo",
+    "ら": "ra", "り": "ri", "る": "ru", "れ": "re", "ろ": "ro",
+    "わ": "wa", "ゐ": "wi", "ゑ": "we", "を": "o",  "ん": "n",
+    "が": "ga", "ぎ": "gi", "ぐ": "gu", "げ": "ge", "ご": "go",
+    "ざ": "za", "じ": "ji", "ず": "zu", "ぜ": "ze", "ぞ": "zo",
+    "だ": "da", "ぢ": "ji", "づ": "zu", "で": "de", "ど": "do",
+    "ば": "ba", "び": "bi", "ぶ": "bu", "べ": "be", "ぼ": "bo",
+    "ぱ": "pa", "ぴ": "pi", "ぷ": "pu", "ぺ": "pe", "ぽ": "po",
+    "ゔ": "vu",
+    "ぁ": "a",  "ぃ": "i",  "ぅ": "u",  "ぇ": "e",  "ぉ": "o",
+    "ゃ": "ya", "ゅ": "yu", "ょ": "yo", "ゎ": "wa",
 }
 
 
-def kana_to_romaji(text):
-    """日本語テキストを英数字（ASCIIローマ字）に変換"""
-    text_clean = text.strip()
-    if text_clean in JAPANESE_TO_ROMAJI:
-        return JAPANESE_TO_ROMAJI[text_clean]
-    
-    # 記号を除去し英数字のみ残す
-    safe_name = re.sub(r"[^\w]", "", text_clean)
-    # 非ASCII文字が含まれている場合はハッシュ値やインデックスを付与
-    if not safe_name.isascii():
-        safe_name = f"item_{abs(hash(text_clean)) % 10000}"
-    return safe_name.lower()
+def _katakana_to_hiragana(text: str) -> str:
+    """カタカナをひらがなに統一"""
+    result = []
+    for ch in text:
+        code = ord(ch)
+        if 0x30A1 <= code <= 0x30F6:
+            result.append(chr(code - 0x60))
+        else:
+            result.append(ch)
+    return "".join(result)
 
 
-def get_valid_numeric_attr(df, col_name, min_val=0, max_val=200):
-    """年齢・性別・条件など、妥当な範囲の数値属性を取り出す"""
-    if col_name in df.columns:
-        vals = df[col_name].dropna().values
-        for v in vals:
-            try:
-                v_num = float(v)
-                if min_val <= v_num <= max_val:
-                    return int(v_num)
-            except Exception:
-                pass
-    return np.nan
+def _builtin_kana_to_romaji(text: str) -> str:
+    """外部ライブラリなしでも動作する汎用かな→ローマ字変換"""
+    hira = _katakana_to_hiragana(text)
+    out: List[str] = []
+    i = 0
+    n = len(hira)
+    while i < n:
+        # 促音「っ」: 次の子音を重ねる
+        if hira[i] == "っ":
+            if i + 1 < n:
+                next_two = hira[i + 1 : i + 3]
+                next_one = hira[i + 1]
+                rom = _KANA_DIGRAPHS.get(next_two) or _KANA_MONOGRAPHS.get(next_one, "")
+                if rom and rom[0].isalpha():
+                    out.append(rom[0])
+            i += 1
+            continue
+
+        # 長音「ー」: 直前の母音を重ねるか省略
+        if hira[i] == "ー":
+            i += 1
+            continue
+
+        # 2文字の拗音・外来音
+        if i + 1 < n and hira[i : i + 2] in _KANA_DIGRAPHS:
+            out.append(_KANA_DIGRAPHS[hira[i : i + 2]])
+            i += 2
+            continue
+
+        # 1文字のかな
+        if hira[i] in _KANA_MONOGRAPHS:
+            out.append(_KANA_MONOGRAPHS[hira[i]])
+            i += 1
+            continue
+
+        # その他（英数字等）はそのまま追加
+        out.append(hira[i])
+        i += 1
+
+    return "".join(out)
 
 
-def get_first_valid_text(df, col_name):
-    """テキスト属性の最初の有効値を取得"""
-    if col_name in df.columns:
-        vals = df[col_name].dropna().values
-        for v in vals:
-            v_str = str(v).strip()
-            if pd.notna(v) and v_str != "" and v_str.lower() != "nan":
-                return v_str
-    return np.nan
-
-
-def process_single_file_for_stats(file, row_index):
+def to_ascii_var_name(text: str, use_romaji: bool = True) -> str:
     """
-    1被験者分の lab.js CSV から、統計分析用の英字変数名（ASCII）でデータ抽出する関数
+    任意の文字列（列名や刺激語）を統計ソフト対応のクリーンな変数名に変換する
     """
-    df = pd.read_csv(file)
-    row = {}
+    text_clean = unicodedata.normalize("NFKC", str(text)).strip()
+    if not text_clean:
+        return "empty"
 
-    # 1. 識別子 & 実験条件 (IV) & 被験者属性
-    row["id"] = row_index
+    if not use_romaji:
+        # ローマ字変換しない場合でも空白やドット等の記号はアンダースコアに整理
+        cleaned = re.sub(r"[\.\-\s/\\:;,]+", "_", text_clean).strip("_")
+        return cleaned if cleaned else "var"
 
-    p_id = get_first_valid_text(df, "participantID")
-    if pd.isna(p_id):
-        row["participantID"] = file.name
-    else:
+    # 1. 既知のカスタム辞書に完全一致する場合
+    if text_clean in CUSTOM_ROMAJI_DICT:
+        return CUSTOM_ROMAJI_DICT[text_clean]
+
+    # 2. かなのみで構成されている場合は内蔵テーブルで正確にローマ字化（外来音「てぃ」「ふにょ」等も正確）
+    hira_check = _katakana_to_hiragana(text_clean)
+    if all((0x3041 <= ord(c) <= 0x3096) or c == "ー" for c in hira_check):
+        romaji_kana = _builtin_kana_to_romaji(text_clean)
+        if romaji_kana.isascii() and romaji_kana.isalnum():
+            return romaji_kana.lower()
+
+    # 3. 漢字等を含む場合は pykakasi でローマ字に変換
+    converted = text_clean
+    if not converted.isascii() and _KAKASI is not None:
         try:
-            row["participantID"] = str(int(float(p_id)))
-        except (ValueError, TypeError):
+            items = _KAKASI.convert(converted)
+            converted = "".join(item.get("hepburn", item.get("orig", "")) for item in items)
+        except Exception:
+            pass
+
+    # 4. 残ったかな文字を内蔵コンバータで変換
+    if not converted.isascii():
+        converted = _builtin_kana_to_romaji(converted)
+
+    # 記号をアンダースコアに置換し、ASCII英数字とアンダースコアのみ残す
+    converted = re.sub(r"[\.\-\s/\\:;,]+", "_", converted)
+    safe_name = re.sub(r"[^0-9a-zA-Z_]", "", converted)
+    safe_name = re.sub(r"_+", "_", safe_name).strip("_")
+
+    if not safe_name:
+        safe_name = f"item_{abs(hash(text_clean)) % 10000}"
+    return safe_name
+
+
+# ==============================================================================
+# 2. ユーティリティ・自動解析関数
+# ==============================================================================
+
+
+def is_system_col(col_name: str) -> bool:
+    """lab.jsのシステム列かどうかを判定"""
+    c = str(col_name).strip()
+    if c in LABJS_SYSTEM_COLS:
+        return True
+    if c.startswith("meta.") or c.startswith("meta_") or c.startswith("Unnamed:"):
+        return True
+    return False
+
+
+def get_valid_series(df: pd.DataFrame, col_name: str) -> pd.Series:
+    """列から空文字や 'nan' を除いた有効な値の Series を返す"""
+    if col_name not in df.columns:
+        return pd.Series([], dtype=object)
+    s = df[col_name].dropna()
+    if s.empty:
+        return s
+    mask = s.astype(str).str.strip().str.lower().isin(["", "nan", "none", "null"])
+    return s[~mask]
+
+
+def parse_scalar_value(val):
+    """数値に変換できる文字列は int または float に変換する"""
+    if pd.isna(val):
+        return np.nan
+    v_str = str(val).strip()
+    if v_str == "" or v_str.lower() in ["nan", "none", "null"]:
+        return np.nan
+    try:
+        v_num = float(v_str)
+        if np.isfinite(v_num):
+            return int(v_num) if v_num.is_integer() else v_num
+    except (ValueError, TypeError):
+        pass
+    return v_str
+
+
+@st.cache_data(show_spinner=False)
+def analyze_uploaded_files(file_bytes_list: List[Tuple[str, bytes]]) -> Dict:
+    """
+    アップロードされた全CSVファイルをスキャンし、各列の性質を自動分類する
+    """
+    all_cols: List[str] = []
+    col_set: Set[str] = set()
+    dfs: List[Tuple[str, pd.DataFrame]] = []
+
+    for fname, bdata in file_bytes_list:
+        try:
+            df = pd.read_csv(io.BytesIO(bdata))
+            dfs.append((fname, df))
+            for c in df.columns:
+                if c not in col_set:
+                    col_set.add(c)
+                    all_cols.append(c)
+        except Exception:
+            pass
+
+    system_cols: List[str] = []
+    single_val_cols: List[str] = []
+    multi_val_cols: List[str] = []
+    trial_key_cols: List[str] = []
+    empty_cols: List[str] = []
+
+    # 被験者ID列の自動検出
+    detected_id_col = "（ファイル名を使用）"
+    for cand in PARTICIPANT_ID_CANDIDATES:
+        if cand in col_set:
+            # 実際に値が入っているか確認
+            has_val = any(not get_valid_series(df, cand).empty for _, df in dfs)
+            if has_val:
+                detected_id_col = cand
+                break
+
+    # 正解列の自動検出
+    detected_answer_col = "（なし / correct列のみ使用）"
+    for cand in CORRECT_ANSWER_COL_CANDIDATES:
+        if cand in col_set:
+            has_val = any(not get_valid_series(df, cand).empty for _, df in dfs)
+            if has_val:
+                detected_answer_col = cand
+                break
+
+    for col in all_cols:
+        if is_system_col(col):
+            system_cols.append(col)
+            continue
+        if col == detected_answer_col:
+            system_cols.append(col)
+            continue
+
+        max_valid_rows = 0
+        max_distinct_vals = 0
+        co_occurs_with_rt_or_resp = False
+
+        for _, df in dfs:
+            valid_s = get_valid_series(df, col)
+            n_rows = len(valid_s)
+            if n_rows > 0:
+                max_valid_rows = max(max_valid_rows, n_rows)
+                n_unique = valid_s.astype(str).str.strip().nunique()
+                max_distinct_vals = max(max_distinct_vals, n_unique)
+
+                if n_rows > 1 and n_unique > 1:
+                    # 同じ行に duration や response / correct があるかチェック
+                    sub_df = df.loc[valid_s.index]
+                    for sys_c in ["duration", "response", "correct"]:
+                        if sys_c in sub_df.columns and sub_df[sys_c].notna().any():
+                            co_occurs_with_rt_or_resp = True
+                            break
+
+        if max_valid_rows == 0:
+            empty_cols.append(col)
+            continue
+
+        col_lower = col.lower().strip()
+        is_trial_hint = col_lower in TRIAL_KEY_NAME_HINTS or any(
+            h == col_lower for h in TRIAL_KEY_NAME_HINTS
+        )
+        is_free_text_hint = any(h in col_lower for h in FREE_TEXT_NAME_HINTS)
+
+        # 1被験者内で複数の異なる値を持つ列の振り分け
+        if max_valid_rows > 1 and max_distinct_vals > 1:
+            if is_trial_hint or (co_occurs_with_rt_or_resp and not is_free_text_hint):
+                trial_key_cols.append(col)
+            else:
+                multi_val_cols.append(col)
+        else:
+            single_val_cols.append(col)
+
+    return {
+        "all_cols": all_cols,
+        "system_cols": system_cols,
+        "empty_cols": empty_cols,
+        "detected_id_col": detected_id_col,
+        "detected_answer_col": detected_answer_col,
+        "single_val_cols": single_val_cols,
+        "multi_val_cols": multi_val_cols,
+        "trial_key_cols": trial_key_cols,
+    }
+
+
+def evaluate_trial_correctness(
+    row_series: pd.Series, answer_col: Optional[str]
+) -> Optional[int]:
+    """
+    1試行の正誤を 1 (正解) / 0 (不正解) / None (判定不能) で返す。
+    lab.js 標準の `correct` 列と、`response == 正解列` の両方に対応。
+    """
+    corr_raw = str(row_series.get("correct", "")).lower().strip()
+    resp_raw = str(row_series.get("response", "")).lower().strip()
+    ans_raw = (
+        str(row_series.get(answer_col, "")).lower().strip()
+        if answer_col and answer_col in row_series
+        else ""
+    )
+
+    if corr_raw in ["true", "1", "1.0"]:
+        return 1
+    if ans_raw not in ["", "nan", "none"] and resp_raw not in ["", "nan", "none"]:
+        if resp_raw == ans_raw:
+            return 1
+        else:
+            return 0
+    if corr_raw in ["false", "0", "0.0"]:
+        return 0
+    return None
+
+
+def extract_single_value(
+    df: pd.DataFrame, col_name: str, strategy: str = "last_non_zero"
+):
+    """
+    1被験者につき1つの値を取り出す。
+    - strategy == "last_non_zero": 最後の有効値（ただし0以外の有効値があればそちらを優先）
+    - strategy == "first": 最初の有効値
+    - strategy == "last": 最後の有効値
+    """
+    valid_s = get_valid_series(df, col_name)
+    if valid_s.empty:
+        return np.nan
+
+    parsed_vals = [parse_scalar_value(v) for v in valid_s.tolist()]
+    parsed_vals = [v for v in parsed_vals if pd.notna(v)]
+    if not parsed_vals:
+        return np.nan
+
+    if strategy == "first":
+        return parsed_vals[0]
+    if strategy == "last":
+        return parsed_vals[-1]
+
+    # デフォルト ("last_non_zero"):
+    # lab.js では初期値 0 が前の行に入り、後の行で実際の値が入るケースが多いため、
+    # 0 以外の値が存在すれば最後の非ゼロ値を返し、すべて 0 なら 0 を返す
+    non_zero_vals = [v for v in parsed_vals if v != 0 and v != "0"]
+    if non_zero_vals:
+        return non_zero_vals[-1]
+    return parsed_vals[-1]
+
+
+# ==============================================================================
+# 3. 1ファイル（1被験者）分のデータ抽出エンジン
+# ==============================================================================
+
+
+def process_participant_df(
+    df: pd.DataFrame,
+    file_name: str,
+    row_index: int,
+    id_col: str,
+    single_cols: List[str],
+    multi_cols: List[str],
+    trial_key_cols: List[str],
+    answer_col: Optional[str],
+    use_romaji: bool,
+    single_strategy: str,
+    include_trial_rt: bool,
+    include_trial_corr: bool,
+    include_trial_resp: bool,
+    calc_task_summary: bool,
+    include_file_name: bool,
+) -> Dict:
+    row: Dict = {}
+
+    # 1. 通し番号 & ファイル名 & 被験者ID
+    row["id"] = row_index
+    if include_file_name:
+        row["file_name"] = file_name
+
+    if id_col and id_col != "（ファイル名を使用）" and id_col in df.columns:
+        p_id = extract_single_value(df, id_col, strategy=single_strategy)
+        if pd.isna(p_id):
+            row["participantID"] = file_name
+        else:
             row["participantID"] = str(p_id)
-
-    row["age"] = get_valid_numeric_attr(df, "age", min_val=10, max_val=120)
-    row["sex"] = get_valid_numeric_attr(df, "sex", min_val=1, max_val=10)
-    row["condition"] = get_valid_numeric_attr(df, "condition", min_val=1, max_val=100)
-
-    # 2. 質問紙尺度・アンケート項目 (DV) -> 英数字変数名
-    for col in df.columns:
-        c_clean = col.replace(".-", "_").replace(".", "_").replace("-", "_")
-        if any(c_clean.startswith(prefix) for prefix in ["q1_", "q2_", "purpose", "comment", "final_consent", "dv_"]):
-            val = get_first_valid_text(df, col)
-            if pd.notna(val):
-                try:
-                    val_num = float(val)
-                    val = int(val_num) if val_num.is_integer() else val_num
-                except Exception:
-                    pass
-            row[c_clean] = val
-
-    # 3. 自由記述 (Recall)
-    if "recall2" in df.columns:
-        recalls = df["recall2"].dropna().tolist()
-        recalls = [r for r in recalls if str(r).strip().lower() not in ["", "nan"]]
-        for idx, r_text in enumerate(recalls, start=1):
-            row[f"recall_text_{idx}"] = r_text
-
-    # 4. 全体成績・集計指標
-    q_corr = get_valid_numeric_attr(df, "quiz_correct_count", min_val=0, max_val=1000)
-    q_tot = get_valid_numeric_attr(df, "quiz_total_count", min_val=1, max_val=1000)
-    row["quiz_correct_count"] = q_corr
-    row["quiz_total_count"] = q_tot
-    if pd.notna(q_corr) and pd.notna(q_tot) and q_tot > 0:
-        row["quiz_accuracy"] = round((q_corr / q_tot) * 100, 2)
     else:
-        row["quiz_accuracy"] = np.nan
+        row["participantID"] = file_name
 
-    ldt_corr = get_valid_numeric_attr(df, "correct_count", min_val=0, max_val=1000)
-    row["ldt_correct_count"] = ldt_corr
-    ldt_rt = get_first_valid_text(df, "mean_rt")
-    if pd.notna(ldt_rt):
-        try: row["ldt_mean_rt"] = float(ldt_rt)
-        except Exception: row["ldt_mean_rt"] = np.nan
-    else:
-        row["ldt_mean_rt"] = np.nan
+    # 2. 単一値列（アンケート・属性・実験条件・既存集計値）の抽出
+    for col in single_cols:
+        if col == id_col:
+            continue
+        var_name = to_ascii_var_name(col, use_romaji=use_romaji)
+        # すでに participantID として格納済みならスキップ
+        if var_name.lower() == "participantid" and "participantID" in row:
+            continue
+        row[var_name] = extract_single_value(df, col, strategy=single_strategy)
 
-    # 5. 各単語の反応時間 (rt_word_[romaji]) と 正誤 (corr_word_[romaji])
-    if "worditem" in df.columns and "duration" in df.columns:
-        word_rows = df[df["worditem"].notna() & (df["worditem"] != "")]
-        for _, r in word_rows.iterrows():
-            w_item = str(r["worditem"]).strip()
-            if not w_item or w_item.lower() == "nan":
-                continue
-            
-            # 日本語単語をローマ字（ASCII英数字）に自動変換
-            w_romaji = kana_to_romaji(w_item)
-            
-            # 反応時間 (ms)
-            dur = r.get("duration")
-            if pd.notna(dur):
+    # 既存CSVに quiz_correct_count と quiz_total_count があれば quiz_accuracy も自動補完
+    if (
+        "quiz_correct_count" in row
+        and "quiz_total_count" in row
+        and "quiz_accuracy" not in row
+    ):
+        qc = row.get("quiz_correct_count")
+        qt = row.get("quiz_total_count")
+        if (
+            isinstance(qc, (int, float))
+            and isinstance(qt, (int, float))
+            and pd.notna(qc)
+            and pd.notna(qt)
+            and qt > 0
+        ):
+            row["quiz_accuracy"] = round((qc / qt) * 100, 2)
+
+    # 3. 複数回答列（自由記述・再生課題など）の連番展開 (`列名_1`, `列名_2`...)
+    for col in multi_cols:
+        if col not in df.columns:
+            continue
+        valid_s = get_valid_series(df, col)
+        base_name = to_ascii_var_name(col, use_romaji=use_romaji)
+        for idx, val in enumerate(valid_s.tolist(), start=1):
+            row[f"{base_name}_{idx}"] = parse_scalar_value(val)
+
+    # 4. 課題（トライアル）キー列ごとの横展開 ＆ 課題集計
+    # 複数のキー列（例: worditem と itemNO）が同じ行に共存する場合、
+    # より具体的な刺激列（非数値の刺激列など）を先に処理し、同じ行の重複展開を防ぐ
+    used_row_indices: Set[int] = set()
+
+    # 非数値の刺激キー列（例: worditem）を数値連番キー列（例: itemNO）より先に処理する
+    def _key_sort_priority(k: str) -> int:
+        if k not in df.columns:
+            return 99
+        s = get_valid_series(df, k)
+        if s.empty:
+            return 99
+        # すべて数値なら後回し（itemNOなど）
+        all_num = all(isinstance(parse_scalar_value(v), (int, float)) for v in s.head(10))
+        return 1 if all_num else 0
+
+    sorted_trial_keys = sorted(trial_key_cols, key=_key_sort_priority)
+
+    for key_col in sorted_trial_keys:
+        if key_col not in df.columns:
+            continue
+
+        valid_s = get_valid_series(df, key_col)
+        if valid_s.empty:
+            continue
+
+        # すでに別の試行キー列（例: worditem）で処理された行は除外
+        remaining_indices = [idx for idx in valid_s.index if idx not in used_row_indices]
+        if not remaining_indices:
+            continue
+
+        trial_rows = df.loc[remaining_indices]
+        used_row_indices.update(remaining_indices)
+
+        key_col_clean = to_ascii_var_name(key_col, use_romaji=use_romaji)
+        # プレフィックスの決定（worditem -> word, itemNO + senderにquiz -> quiz 等）
+        has_quiz_sender = (
+            "sender" in trial_rows.columns
+            and trial_rows["sender"].astype(str).str.contains("quiz", case=False, na=False).any()
+        )
+        if key_col.lower() == "worditem":
+            prefix_label = "word"
+        elif has_quiz_sender and key_col.lower() in ["itemno", "item_no", "item"]:
+            prefix_label = "quiz"
+        else:
+            prefix_label = key_col_clean
+
+        task_rts: List[float] = []
+        task_correct_rts: List[float] = []
+        task_corrs: List[int] = []
+
+        for _, r in trial_rows.iterrows():
+            raw_key_val = r[key_col]
+            parsed_key = parse_scalar_value(raw_key_val)
+
+            if isinstance(parsed_key, int):
+                item_suffix = f"q{parsed_key:02d}" if prefix_label == "quiz" else f"{parsed_key:02d}"
+            else:
+                item_suffix = to_ascii_var_name(str(raw_key_val), use_romaji=use_romaji)
+
+            # (a) 反応時間 (duration)
+            rt_val = None
+            if "duration" in r and pd.notna(r["duration"]):
                 try:
-                    row[f"rt_word_{w_romaji}"] = round(float(dur), 1)
-                except Exception:
+                    rt_val = round(float(r["duration"]), 1)
+                    task_rts.append(rt_val)
+                except (ValueError, TypeError):
                     pass
-            
-            # 正誤 (1 / 0)
-            corr = str(r.get("correct", "")).lower().strip()
-            ans_resp = str(r.get("response", "")).lower().strip()
-            sk = str(r.get("seikai", "")).lower().strip()
-            if corr in ["true", "1", "1.0"] or (ans_resp != "" and ans_resp == sk):
-                row[f"corr_word_{w_romaji}"] = 1
-            elif corr in ["false", "0", "0.0"]:
-                row[f"corr_word_{w_romaji}"] = 0
 
-    # 6. クイズ各問の正誤 (quiz_q01 〜 quiz_qN)
-    if "itemNO" in df.columns and "sender" in df.columns:
-        quiz_rows = df[df["sender"].str.contains("quiz", case=False, na=False) & df["itemNO"].notna()]
-        for _, r in quiz_rows.iterrows():
-            item_no = r.get("itemNO")
-            if pd.notna(item_no):
-                try:
-                    q_num = int(float(item_no))
-                    corr = str(r.get("correct", "")).lower().strip()
-                    ans_resp = str(r.get("response", "")).lower().strip()
-                    sk = str(r.get("seikai", "")).lower().strip()
-                    
-                    if corr in ["true", "1", "1.0"] or (ans_resp != "" and ans_resp == sk):
-                        row[f"quiz_q{q_num:02d}"] = 1
-                    elif corr in ["false", "0", "0.0"]:
-                        row[f"quiz_q{q_num:02d}"] = 0
-                except Exception:
-                    pass
+            # (b) 正誤 (correct / response == answer_col)
+            corr_val = evaluate_trial_correctness(r, answer_col)
+            if corr_val is not None:
+                task_corrs.append(corr_val)
+                if corr_val == 1 and rt_val is not None:
+                    task_correct_rts.append(rt_val)
+
+            # (c) 個別試行カラムへの書き出し
+            if prefix_label == "quiz" and key_col.lower() in ["itemno", "item_no", "item"]:
+                # クイズ形式 (quiz_q01, rt_quiz_q01)
+                if include_trial_corr and corr_val is not None:
+                    row[f"quiz_{item_suffix}"] = corr_val
+                if include_trial_rt and rt_val is not None:
+                    row[f"rt_quiz_{item_suffix}"] = rt_val
+                if include_trial_resp and "response" in r and pd.notna(r["response"]):
+                    row[f"resp_quiz_{item_suffix}"] = parse_scalar_value(r["response"])
+            else:
+                if include_trial_rt and rt_val is not None:
+                    row[f"rt_{prefix_label}_{item_suffix}"] = rt_val
+                if include_trial_corr and corr_val is not None:
+                    row[f"corr_{prefix_label}_{item_suffix}"] = corr_val
+                if include_trial_resp and "response" in r and pd.notna(r["response"]):
+                    row[f"resp_{prefix_label}_{item_suffix}"] = parse_scalar_value(
+                        r["response"]
+                    )
+
+        # (d) 課題全体の自動集計指標（正答数・総数・正答率・平均RT）
+        if calc_task_summary:
+            if task_corrs:
+                c_cnt = int(sum(task_corrs))
+                t_cnt = len(task_corrs)
+                acc = round((c_cnt / t_cnt) * 100, 2) if t_cnt > 0 else np.nan
+                row.setdefault(f"{prefix_label}_calc_correct_count", c_cnt)
+                row.setdefault(f"{prefix_label}_calc_total_count", t_cnt)
+                row.setdefault(f"{prefix_label}_calc_accuracy", acc)
+            if task_rts:
+                row.setdefault(
+                    f"{prefix_label}_calc_mean_rt", round(float(np.mean(task_rts)), 2)
+                )
+            if task_correct_rts:
+                row.setdefault(
+                    f"{prefix_label}_calc_correct_mean_rt",
+                    round(float(np.mean(task_correct_rts)), 2),
+                )
 
     return row
 
 
-if uploaded_files:
-    st.success(f"{len(uploaded_files)} 個のファイルが読み込まれました。")
+# ==============================================================================
+# 4. メイン UI
+# ==============================================================================
 
-    if st.button("📊 統計解析用データセット（英字変数名）を作成する"):
+uploaded_files = st.file_uploader(
+    "📁 lab.js の CSV ファイルを選択、またはドラッグ＆ドロップしてください（複数選択可）",
+    type=["csv"],
+    accept_multiple_files=True,
+)
+
+if uploaded_files:
+    st.success(f"✅ {len(uploaded_files)} 個のCSVファイルが読み込まれました。")
+
+    # キャッシュ解析用にバイト列を取得
+    file_bytes_list = [(f.name, f.getvalue()) for f in uploaded_files]
+    analysis = analyze_uploaded_files(file_bytes_list)
+    all_non_empty_cols = [
+        c for c in analysis["all_cols"] if c not in analysis["empty_cols"]
+    ]
+
+    with st.expander("⚙️ 抽出・展開ルールの確認とカスタマイズ（自動検出済み）", expanded=True):
+        st.caption(
+            "アップロードされたCSVの列構造を自動解析しました。そのまま下の作成ボタンを押すか、必要に応じて設定を調整してください。"
+        )
+
+        col_left, col_right = st.columns(2)
+
+        with col_left:
+            id_options = ["（ファイル名を使用）"] + all_non_empty_cols
+            default_id_idx = (
+                id_options.index(analysis["detected_id_col"])
+                if analysis["detected_id_col"] in id_options
+                else 0
+            )
+            selected_id_col = st.selectbox(
+                "🆔 被験者IDとして使用する列",
+                options=id_options,
+                index=default_id_idx,
+                help="被験者IDが記録されている列を選択します。存在しない場合はファイル名が participantID になります。",
+            )
+
+            ans_options = ["（なし / correct列のみ使用）"] + all_non_empty_cols
+            default_ans_idx = (
+                ans_options.index(analysis["detected_answer_col"])
+                if analysis["detected_answer_col"] in ans_options
+                else 0
+            )
+            selected_ans_col = st.selectbox(
+                "🎯 正解キーが格納されている列（任意）",
+                options=ans_options,
+                index=default_ans_idx,
+                help="lab.js標準の `correct` 列以外に、`response` と比較する正解列（例: `seikai`, `answer`）がある場合に指定します。",
+            )
+
+            single_strategy_label = st.selectbox(
+                "📌 単一値列で複数行に値がある場合の優先ルール",
+                options=[
+                    "最後の非ゼロ有効値を優先（推奨：lab.jsのstate更新に対応）",
+                    "最初の有効値を取得",
+                    "最後の有効値を取得",
+                ],
+                index=0,
+            )
+            strategy_map = {
+                "最後の非ゼロ有効値を優先（推奨：lab.jsのstate更新に対応）": "last_non_zero",
+                "最初の有効値を取得": "first",
+                "最後の有効値を取得": "last",
+            }
+            single_strategy = strategy_map[single_strategy_label]
+
+        with col_right:
+            use_romaji = st.checkbox(
+                "🔤 日本語の列名・刺激語をローマ字（ASCII英数字）に自動変換する",
+                value=True,
+                help="SPSS / R / Jamovi 等で文字化けや変数名エラーが起きないよう、ひらがな・カタカナ・漢字をローマ字に変換し記号を `_` に統一します。",
+            )
+            include_file_name = st.checkbox(
+                "📄 元のCSVファイル名 (`file_name`) 列も出力する",
+                value=False,
+            )
+            calc_task_summary = st.checkbox(
+                "📈 課題ごとの正答率・平均RT（全体／正答のみ）を自動計算して追加する",
+                value=True,
+            )
+
+            t_col1, t_col2, t_col3 = st.columns(3)
+            with t_col1:
+                include_trial_rt = st.checkbox("⏱️ 試行ごとのRT", value=True)
+            with t_col2:
+                include_trial_corr = st.checkbox("⭕ 試行ごとの正誤", value=True)
+            with t_col3:
+                include_trial_resp = st.checkbox("💬 試行ごとの回答値", value=False)
+
+        st.divider()
+
+        selected_single_cols = st.multiselect(
+            "📌 単一値として抽出する列（アンケート・属性・実験条件・既存集計スコアなど：1被験者1列）",
+            options=all_non_empty_cols,
+            default=analysis["single_val_cols"],
+            help="1被験者につき1つの値を持つ列です。システム列以外のすべての質問項目・属性列が自動選択されています。",
+        )
+
+        selected_multi_cols = st.multiselect(
+            "📝 連番展開する複数回答列（自由記述の複数回答・再生課題など：`列名_1`, `列名_2`...）",
+            options=all_non_empty_cols,
+            default=analysis["multi_val_cols"],
+            help="1人の被験者が複数行にわたって回答した列（自由再生など）を、`列名_1`, `列名_2`... として横に展開します。",
+        )
+
+        selected_trial_keys = st.multiselect(
+            "⏱️ 課題（トライアル）の試行キー列（刺激語・問題番号ごとにRTや正誤を横展開）",
+            options=all_non_empty_cols,
+            default=analysis["trial_key_cols"],
+            help="刺激語（例: `worditem`）や問題番号（例: `itemNO`）の列を指定すると、各刺激・各問ごとの反応時間や正誤を横展開します。",
+        )
+
+    if st.button("📊 統計解析用ワイドデータセット（1被験者1行）を作成する", type="primary"):
         rows = []
         progress_bar = st.progress(0)
+        ans_col_arg = (
+            None
+            if selected_ans_col == "（なし / correct列のみ使用）"
+            else selected_ans_col
+        )
 
-        for i, file in enumerate(uploaded_files):
+        for i, (fname, bdata) in enumerate(file_bytes_list):
             try:
-                row = process_single_file_for_stats(file, i + 1)
+                df = pd.read_csv(io.BytesIO(bdata))
+                row = process_participant_df(
+                    df=df,
+                    file_name=fname,
+                    row_index=i + 1,
+                    id_col=selected_id_col,
+                    single_cols=selected_single_cols,
+                    multi_cols=selected_multi_cols,
+                    trial_key_cols=selected_trial_keys,
+                    answer_col=ans_col_arg,
+                    use_romaji=use_romaji,
+                    single_strategy=single_strategy,
+                    include_trial_rt=include_trial_rt,
+                    include_trial_corr=include_trial_corr,
+                    include_trial_resp=include_trial_resp,
+                    calc_task_summary=calc_task_summary,
+                    include_file_name=include_file_name,
+                )
                 rows.append(row)
             except Exception as e:
-                st.error(f"エラー ({file.name}): {e}")
-            progress_bar.progress((i + 1) / len(uploaded_files))
+                st.error(f"エラー ({fname}): {e}")
+            progress_bar.progress((i + 1) / len(file_bytes_list))
 
         summary_df = pd.DataFrame(rows)
 
         # 優先度の高い基本列を先頭に整理
         priority_order = [
-            "id", "participantID", "age", "sex", "condition",
-            "quiz_correct_count", "quiz_total_count", "quiz_accuracy",
-            "ldt_correct_count", "ldt_mean_rt"
+            "id",
+            "file_name",
+            "participantID",
+            "age",
+            "sex",
+            "gender",
+            "condition",
+            "group",
         ]
         first_cols = [c for c in priority_order if c in summary_df.columns]
         other_cols = [c for c in summary_df.columns if c not in first_cols]
         summary_df = summary_df[first_cols + other_cols]
 
-        st.subheader("📊 統計解析用データセットプレビュー（全ASCII英数字変数名）")
-        st.write(f"総被験者数 ($N$): **{len(summary_df)}** 人 / 分析変数（カラム数）: **{len(summary_df.columns)}** 変数")
-        st.dataframe(summary_df.head(10))
+        st.subheader("📊 データセットプレビュー（1被験者1行・ワイド形式）")
+        st.write(
+            f"総被験者数 ($N$): **{len(summary_df)}** 人 ／ "
+            f"抽出された変数（カラム数）: **{len(summary_df.columns)}** 変数"
+        )
+        st.dataframe(summary_df, use_container_width=True)
 
-        # CSVダウンロード
+        # CSVダウンロード（UTF-8 BOM付き）
         csv_data = summary_df.to_csv(index=False, encoding="utf-8-sig").encode(
             "utf-8-sig"
         )
@@ -222,4 +864,5 @@ if uploaded_files:
             data=csv_data,
             file_name="summary_stats_data.csv",
             mime="text/csv",
+            type="primary",
         )
